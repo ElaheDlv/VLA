@@ -2,6 +2,7 @@ import carla
 import time
 import numpy as np
 import cv2
+import threading
 
 # ── 1. Connect to CARLA ─────────────────────────────
 client = carla.Client('localhost', 2000)
@@ -17,15 +18,17 @@ landmarks = {
     "restaurant": carla.Location(x= 18, y=326, z=0)
 }
 
-# Example prompt match (you’d compute this with your embedding code)
 matched_location = "bank"  
 goal_loc = landmarks[matched_location]
 
 # ── 3. Plan route ────────────────────────────────────
+import sys
+sys.path.append('/home/bimi/users/elahe/CARLA_0.9.15/PythonAPI')
+sys.path.append('/home/bimi/users/elahe/CARLA_0.9.15/PythonAPI/carla')
+sys.path.append('/home/bimi/users/elahe/CARLA_0.9.15/PythonAPI/carla/agents')
 from agents.navigation.global_route_planner import GlobalRoutePlanner
-planner = GlobalRoutePlanner(carla_map, sampling_resolution=2.0)
 
-# choose spawn point
+planner = GlobalRoutePlanner(carla_map, sampling_resolution=2.0)
 spawn_points = carla_map.get_spawn_points()
 start_loc = spawn_points[1].location
 route = planner.trace_route(start_loc, goal_loc)
@@ -38,7 +41,6 @@ cam_bp.set_attribute('image_size_x', '800')
 cam_bp.set_attribute('image_size_y', '800')
 cam_bp.set_attribute('fov', '90')
 
-# position it high above the centre of interest
 camera_transform = carla.Transform(
     carla.Location(x=200, y=200, z=250),
     carla.Rotation(pitch=-90, yaw=0, roll=0)
@@ -49,7 +51,6 @@ time.sleep(1.0)  # let the sensor initialize
 # ── 5. Helpers: compute proj matrices ─────────────────
 def get_cam_matrices(cam):
     T = cam.get_transform()
-    # build rotation matrices from Euler angles
     import math
     pr = math.radians(T.rotation.pitch)
     yr = math.radians(T.rotation.yaw)
@@ -65,12 +66,10 @@ def get_cam_matrices(cam):
                     [0, math.sin(rr),  math.cos(rr)]])
     R = R_x @ R_y @ R_z
     t = np.array([T.location.x, T.location.y, T.location.z])
-    # world → camera
     world2cam = np.eye(4)
     world2cam[:3,:3] = R.T
     world2cam[:3, 3] = -R.T @ t
 
-    # intrinsics
     w = int(cam.attributes['image_size_x'])
     h = int(cam.attributes['image_size_y'])
     fov = float(cam.attributes['fov'])
@@ -83,20 +82,23 @@ def get_cam_matrices(cam):
 world2cam, K = get_cam_matrices(camera)
 
 # ── 6. Capture one frame & annotate ──────────────────
+save_event = threading.Event()
+
 def process_and_save(image):
-    # convert to H×W×3 array
     arr = np.frombuffer(image.raw_data, dtype=np.uint8)
     arr = arr.reshape((image.height, image.width, 4))[:, :, :3]
+
+    # keep only RGB channels and make it writeable
+    arr = arr[:, :, :3].copy()   # <-- .copy() ensures arr.flags.writeable == True
 
     def project(pt):
         P = np.array([pt.x, pt.y, pt.z, 1.0])
         cam_coords = world2cam @ P
-        if cam_coords[2] <= 0: 
-            return None
+        if cam_coords[2] <= 0: return None
         uvw = K @ cam_coords[:3]
         return int(uvw[0]/uvw[2]), int(uvw[1]/uvw[2])
 
-    # draw each landmark
+    # draw landmarks
     for name, loc in landmarks.items():
         pix = project(loc)
         if pix:
@@ -104,24 +106,27 @@ def process_and_save(image):
             cv2.putText(arr, name, (pix[0]+5,pix[1]-5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
-    # draw goal highlight
+    # goal highlight
     goal_pix = project(goal_loc)
     if goal_pix:
         cv2.circle(arr, goal_pix, 12, (0,255,0), -1)
         cv2.putText(arr, "GOAL", (goal_pix[0], goal_pix[1]-15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
-    # draw route polyline
-    pts = [project(wp) for wp in route_locs]
+    # route polyline
+    pts = [project(w) for w in route_locs]
     pts = [p for p in pts if p]
     if len(pts)>1:
         cv2.polylines(arr, [np.array(pts)], False, (255,0,255), thickness=4)
 
-    # save
     cv2.imwrite("bev_with_route.png", arr)
-    print("Saved BEV with route & landmarks as bev_with_route.png")
-
+    print(">> Saved bev_with_route.png")
     camera.stop()
     camera.destroy()
+    save_event.set()
 
 camera.listen(process_and_save)
+
+# ── 7. Wait for the image to be saved ───────────────
+if not save_event.wait(timeout=5.0):
+    print("⚠️ Timeout: no image received in 5s")
